@@ -20,6 +20,7 @@ use tracing::instrument;
 
 use crate::{
     archive::Archive,
+    authorization::BatchVerificationContext,
     state::State,
     types::{
         AuthorizedTransaction, Network, THIS_SIDECHAIN, VERSION, Version,
@@ -177,13 +178,16 @@ const SIGNET_SEED_NODE_ADDRS: &[SeedAddress<&str>] = {
     &[SIGNET_MINING_SERVER, BIP300_XYZ]
 };
 
-const ALPHANET_SEED_NODE_ADDRS: &[SeedAddress<&str>] = {
-    // The alphanet server runs a node for this chain.
-    const ALPHANET_SERVER: SeedAddress<&str> = SeedAddress {
-        host: url::Host::Ipv4(Ipv4Addr::new(204, 168, 254, 113)),
+const BETANET_SEED_NODE_ADDRS: &[SeedAddress<&str>] = {
+    const DRIVECHA_IN: SeedAddress<&str> = SeedAddress {
+        host: url::Host::Domain("seed.beta.ecash.drivecha.in"),
         port: DEFAULT_PORT,
     };
-    &[ALPHANET_SERVER]
+    const ECASH_NINJA: SeedAddress<&str> = SeedAddress {
+        host: url::Host::Domain("seed.beta.ecash.ninja"),
+        port: DEFAULT_PORT,
+    };
+    &[DRIVECHA_IN, ECASH_NINJA]
 };
 
 /// Add every seed IP address the network names that the database does not
@@ -210,9 +214,9 @@ const fn seed_node_addrs(
     network: Network,
 ) -> &'static [SeedAddress<&'static str>] {
     match network {
-        Network::Alphanet => ALPHANET_SEED_NODE_ADDRS,
-        Network::Signet => SIGNET_SEED_NODE_ADDRS,
+        Network::Betanet => BETANET_SEED_NODE_ADDRS,
         Network::Regtest => &[],
+        Network::Signet => SIGNET_SEED_NODE_ADDRS,
     }
 }
 
@@ -277,6 +281,7 @@ pub struct DialSeedsHandle(
 pub struct Net {
     pub server: Endpoint,
     archive: Archive,
+    pub(crate) batch_verification_ctxt: BatchVerificationContext,
     pub dns_resolver: Arc<TokioResolver>,
     magic_bytes: peer::message::MagicBytes,
     state: State,
@@ -416,6 +421,7 @@ impl Net {
         let connection_ctxt = PeerConnectionCtxt {
             env,
             archive: self.archive.clone(),
+            batch_verification_ctxt: self.batch_verification_ctxt,
             magic_bytes: self.magic_bytes,
             resolved_address: resolved_addr,
             state: self.state.clone(),
@@ -553,6 +559,7 @@ impl Net {
         runtime: &tokio::runtime::Handle,
         env: &sneed::Env<heed::WithoutTls>,
         archive: Archive,
+        batch_verification_ctxt: BatchVerificationContext,
         magic_bytes_override: Option<peer::message::MagicBytes>,
         network: Network,
         state: State,
@@ -607,6 +614,7 @@ impl Net {
         let net = Net {
             server,
             archive,
+            batch_verification_ctxt,
             dns_resolver,
             magic_bytes,
             state,
@@ -745,6 +753,7 @@ impl Net {
         let connection_ctxt = PeerConnectionCtxt {
             env,
             archive: self.archive.clone(),
+            batch_verification_ctxt: self.batch_verification_ctxt,
             magic_bytes: self.magic_bytes,
             resolved_address: addr.into(),
             state: self.state.clone(),
@@ -963,6 +972,9 @@ mod peer_handle_test {
             &tokio::runtime::Handle::current(),
             &env,
             archive,
+            crate::authorization::BatchVerificationContext::new(
+                &mut rand::rng(),
+            ),
             None,
             Network::Regtest,
             state,
@@ -1197,6 +1209,7 @@ mod peer_handle_test {
         let connection_ctxt = PeerConnectionCtxt {
             env,
             archive: net.archive.clone(),
+            batch_verification_ctxt: net.batch_verification_ctxt,
             magic_bytes: net.magic_bytes,
             resolved_address: addr.into(),
             state: net.state.clone(),

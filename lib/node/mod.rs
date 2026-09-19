@@ -14,6 +14,7 @@ use tonic::transport::Channel;
 
 use crate::{
     archive::{self, Archive},
+    authorization::{BatchVerificationContext, rand_core::CryptoRng},
     mempool::{self, MemPool},
     net::{self, DialSeedsHandle, Net, Peer},
     state::{self, State},
@@ -108,8 +109,8 @@ pub struct NodeConfig<MainchainTransport = Channel> {
     pub datadir: std::path::PathBuf,
     pub bind_addr: SocketAddr,
     pub cusf_mainchain: mainchain::ValidatorClient<MainchainTransport>,
-    pub cusf_mainchain_wallet:
-        Option<mainchain::WalletClient<MainchainTransport>>,
+    pub cusf_mainchain_block_producer:
+        Option<mainchain::BlockProducerClient<MainchainTransport>>,
     pub magic_bytes_override: Option<crate::net::peer_message::MagicBytes>,
     pub network: Network,
     pub server_names: HashSet<String>,
@@ -120,9 +121,10 @@ pub struct NodeConfig<MainchainTransport = Channel> {
 #[derive(Clone)]
 pub struct Node<MainchainTransport = Channel> {
     archive: Archive,
+    batch_verification_ctxt: BatchVerificationContext,
     cusf_mainchain: mainchain::ValidatorClient<MainchainTransport>,
-    cusf_mainchain_wallet:
-        Option<Arc<Mutex<mainchain::WalletClient<MainchainTransport>>>>,
+    cusf_mainchain_block_producer:
+        Option<Arc<Mutex<mainchain::BlockProducerClient<MainchainTransport>>>>,
     /// Swap IDs we created that are still pending (mempool). Only creator can cancel those.
     created_pending_swap_ids: Arc<StdMutex<HashSet<SwapId>>>,
     _dial_seeds: Arc<DialSeedsHandle>,
@@ -140,14 +142,16 @@ impl<MainchainTransport> Node<MainchainTransport>
 where
     MainchainTransport: proto::Transport,
 {
-    pub fn new(
+    pub fn new<R>(
         config: NodeConfig<MainchainTransport>,
+        rng: &mut R,
         runtime: &tokio::runtime::Runtime,
     ) -> Result<Self, Error>
     where
         mainchain::ValidatorClient<MainchainTransport>: Clone,
         MainchainTransport: Send + 'static,
         proto::TransportFuture<MainchainTransport>: Send,
+        R: CryptoRng,
     {
         tracing::info!("Node::new: Starting initialization");
         let env_path = config.datadir.join("data.mdb");
@@ -217,10 +221,12 @@ where
             );
         tracing::info!("Node::new: MainchainTaskHandle created");
         tracing::info!(bind_addr = %config.bind_addr, "Node::new: Creating Net");
+        let batch_verification_ctxt = BatchVerificationContext::new(rng);
         let (net, peer_info_rx, dial_seeds) = Net::new(
             runtime.handle(),
             &env,
             archive.clone(),
+            batch_verification_ctxt,
             config.magic_bytes_override,
             config.network,
             state.clone(),
@@ -245,9 +251,9 @@ where
             config.l1_rpc_config_path,
         );
         tracing::info!("Node::new: NetTaskHandle created");
-        let cusf_mainchain_wallet = config
-            .cusf_mainchain_wallet
-            .map(|wallet| Arc::new(Mutex::new(wallet)));
+        let cusf_mainchain_block_producer = config
+            .cusf_mainchain_block_producer
+            .map(|block_producer| Arc::new(Mutex::new(block_producer)));
         // Check for corrupted swaps and automatically reconstruct if needed
         {
             tracing::info!("Node::new: Checking for corrupted swaps");
@@ -296,8 +302,9 @@ where
         );
         Ok(Self {
             archive,
+            batch_verification_ctxt,
             cusf_mainchain: config.cusf_mainchain,
-            cusf_mainchain_wallet,
+            cusf_mainchain_block_producer,
             created_pending_swap_ids: Arc::new(StdMutex::new(HashSet::new())),
             _dial_seeds: Arc::new(dial_seeds),
             env,
@@ -404,7 +411,11 @@ where
                 .regenerate_proof(&rwtxn, &mut transaction.transaction)?;
 
             // Try to validate the transaction
-            match self.state.validate_transaction(&rwtxn, &transaction) {
+            match self.state.validate_transaction(
+                &rwtxn,
+                &self.batch_verification_ctxt,
+                &transaction,
+            ) {
                 Ok(_) => {
                     // Validation succeeded, add to mempool
                     self.mempool.put(&mut rwtxn, &transaction)?;
@@ -440,6 +451,7 @@ where
                             self.state
                                 .validate_transaction(
                                     &retry_rwtxn,
+                                    &self.batch_verification_ctxt,
                                     &transaction,
                                 )
                                 .map_err(|e| Error::State(Box::new(e)))?;
@@ -682,7 +694,11 @@ where
             }
             if self
                 .state
-                .validate_transaction(&rwtxn, &transaction)
+                .validate_transaction(
+                    &rwtxn,
+                    &self.batch_verification_ctxt,
+                    &transaction,
+                )
                 .is_err()
             {
                 self.mempool
@@ -880,19 +896,27 @@ where
         };
         let rotxn = self.env.read_txn().map_err(EnvError::from)?;
         let bundle = self.state.get_pending_withdrawal_bundle(&rotxn)?;
-        if let Some((bundle, _)) = bundle
-            && let Some(cusf_mainchain_wallet) =
-                self.cusf_mainchain_wallet.as_ref()
-        {
+        if let Some((bundle, _)) = bundle {
             let m6id = bundle.compute_m6id();
+            if let Some(cusf_mainchain_block_producer) =
+                self.cusf_mainchain_block_producer.as_ref()
             {
-                let mut cusf_mainchain_wallet_lock =
-                    cusf_mainchain_wallet.lock().await;
-                let () = cusf_mainchain_wallet_lock
-                    .broadcast_withdrawal_bundle(bundle.tx())
-                    .await?;
+                {
+                    let mut cusf_mainchain_block_producer_lock =
+                        cusf_mainchain_block_producer.lock().await;
+                    let () = cusf_mainchain_block_producer_lock
+                        .propose_withdrawal_bundle(bundle.tx())
+                        .await?;
+                }
+                tracing::trace!(%m6id, "Proposed withdrawal bundle");
+            } else {
+                tracing::warn!(
+                    %m6id,
+                    "Withdrawal bundle is pending, but the mainchain node \
+                     does not serve BlockProducerService, so the bundle \
+                     cannot be proposed and the withdrawal cannot complete",
+                );
             }
-            tracing::trace!(%m6id, "Broadcast withdrawal bundle");
         }
         Ok(true)
     }
